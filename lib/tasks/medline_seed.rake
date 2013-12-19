@@ -2,8 +2,8 @@ require 'open-uri'
 require 'nokogiri'
 require_relative "topics"
 
-UNWANTED = ['',' ', ',', ';']
-UNWANTED_REGEX = /(,| |;)/
+UNWANTED = ['',' ', ',', ';','--']
+UNWANTED_REGEX = /(,| |;|--)/
 
 def split(term)
   term.split(UNWANTED_REGEX).reject!{|s| UNWANTED.include?(s)}
@@ -23,7 +23,7 @@ def tokenize(term)
   t = if term.match(UNWANTED_REGEX)
         split(term.downcase)
       else
-        term
+        [term]
       end
 
   t.sort
@@ -116,76 +116,35 @@ task seed_medline: :environment do
     base_url: "http://wsearch.nlm.nih.gov/ws/query?db=healthTopics"
   ).first_or_create
 
-  matches = []
-  alternatives = []
-  topics = {}
-  odds = []
-  MEDLINE_TERMS.each_with_object({}) do |pair, hash|
-    if pair[0] == pair[1]
-      term = Term.where(name: pair[0]).first_or_create
-      odds << term
-      matches << pair
-    elsif pair[0] != pair[1]
-      term = Term.where(name: pair[0]).first_or_create
-      alt = Term.where(name: pair[1]).first_or_create
-      term.alternatives << alt
-      alternatives << alt
-      hash[pair[0]] ||= []
-      hash[pair[0]] << alt
-    else
-      odds << pair
-    end
-    topics = hash
-  end
+  MEDLINE_TERMS.uniq.sort.each do |term|
+    unless Term.where(name: term).first
+      new_term = Term.where(name: term).first_or_create
+      tokens = tokenize(term)
+      search = Search.create(tokens: tokens)
 
-  MEDLINE_PAIRS.each_pair do |term_key, alts|
-    puts "MEDLINE_PAIRS: term: #{term_key} alt: #{alts}"
-    term = Term.where(name: term_key).first_or_create
-    # create tokens for search
-    tokens = Search.convert(term_key + ' ' + alts.join(' '))
-    puts "TOKENS: #{tokens}"
-    #create or find search enginge
+      new_term.search_engines << SEARCH_ENGINE
+      new_term.searches << search
 
+      results = search(term)
 
-    #create term
-    new_term = Term.where(name: term_key).first_or_create
-    puts "SEARCH_ENGINE: #{term}"
-    alt_terms = alts.map{ |a| a }
-    puts "ALT_TERMS: #{alt_terms.inspect}"
+      results.each do |s|
 
-    #add alternatives to term
-    alt_terms.each do |a|
-      new_term.alternatives << Term.where(name: a).first_or_create
-    end
-    # create search
-    puts "TERM: #{term.inspect}"
-    puts "TOKENS: #{tokens}"
+        # create source & ranking
+        source = Source.where(title: s["organizationName"]).first_or_create
+        rank = Ranking.create(position: s['rank'])
 
-    db_search = new_term.searches.where(tokens: tokens).first_or_create do |srch|
-      # add term to search
-      puts "SEARCH  #{srch.inspect}"
-      puts "SEARCH.tokens:  #{srch.tokens}"
-      new_term.searches << srch
-      #add search to search_engine
-      # SEARCH_ENGINE.searches << search
-    end
-    #get search results
-    results = search(term_key)
-
-    results.each do |s|
-    # create source
-
-    #create search result
-      Source.where(title: s["organizationName"]).first_or_create
-
-      result = Result.create(
-            title: s["title"],
-            summary: s["FullSummary"],
-            url: s["url"],
-            snippet: s["snippet"],
-          )
-      rank = result.rankings.create(position: s['rank'])
-      db_search.rankings << rank
+        #create search result
+        Result.where(
+          title: s["title"],
+          summary: s["FullSummary"],
+          url: s["url"],
+          snippet: s["snippet"],
+        ).first_or_create do |new_result|
+          source.results << new_result
+          search.rankings << rank
+          new_result.rankings << rank
+        end
+      end
     end
   end
 end
